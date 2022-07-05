@@ -6,7 +6,7 @@ from torch import optim
 
 import argparse
 # from models.Autoformer_new import Model as GNN_autoformer
-from models.model2 import Model as GNN_autoformer
+from models.model import Model as GNN_autoformer
 from utils.configs import define_setup
 from utils.data import trainingset_construct, load_graph_data, sparse_adj
 from utils.train_test import train, eval
