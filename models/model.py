@@ -1,91 +1,9 @@
+from xxlimited import new
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 
-class time_embedding(nn.Module):
-
-    def __init__(self, out_dim):
-        super(time_embedding, self).__init__()
-
-        self.fcnn = nn.Sequential(nn.Linear(2, 32), nn.GELU(), nn.Linear(32,32), nn.GELU(), nn.Linear(32, out_dim))
-
-    def forward(self, x, t):
-
-        '''
-        input
-        x: (B,T,N)
-        t: (B,T)
-
-        return 
-        (B,T,N,F)
-        '''
-
-        # combine the information of x and t
-        B,T,N = x.shape
-        t = t.unsqueeze(-1).repeat(1,1,N)
-        x = torch.cat((x.unsqueeze(-1), t.unsqueeze(-1)), -1)    # (B,T,N,2)
-
-        # apply neural network
-        x = self.fcnn(x)   # (B,T,N,F)
-
-        return x
-
-class multi_scale(nn.Module):
-
-    def __init__(self):
-        super(multi_scale, self).__init__()
-
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(in_channels=1, out_channels=16, kernel_size=(1,3), stride=(1,3)),
-            nn.ReLU()
-        )
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(in_channels=16, out_channels=32, kernel_size=(1,4), stride=(1,4)),
-            nn.ReLU()
-        )
-        self.conv3 = nn.Sequential(
-            nn.Conv2d(in_channels=32, out_channels=64, kernel_size=(1,6), stride=(1,6)),
-            nn.ReLU()
-        )
-        self.conv4 = nn.Sequential(
-            nn.Conv2d(in_channels=64, out_channels=128, kernel_size=(1,4), stride=(1,4)),
-            nn.ReLU()
-        )
-
-        # define "feature return" convolution layer 
-        self.decode2 = nn.Conv2d(in_channels=16, out_channels=1, kernel_size=(1,1), stride=(1,1))
-        self.decode3 = nn.Conv2d(in_channels=32, out_channels=1, kernel_size=(1,1), stride=(1,1))
-        self.decode4 = nn.Conv2d(in_channels=64, out_channels=1, kernel_size=(1,1), stride=(1,1))
-        self.decode5 = nn.Conv2d(in_channels=128, out_channels=1, kernel_size=(1,1), stride=(1,1))
-            
-
-    def forward(self, x):
-
-        '''
-        input
-        x: (B,N,T = 1 week,1)
-
-        return 
-        (B,N,T,1)
-        '''
-
-        # apply convolution
-        x = x.permute(0,3,1,2)    # (B, 1, N, T)
-        x_quarter = self.conv1(x)    # (B, 16, N, T/3 week)
-        x_hour = self.conv2(x_quarter)    # (B, 32, N, 7*24 hours)
-        x_6hour = self.conv3(x_hour)    # (B, 64, N, 7*4 segment)
-        x_week = self.conv4(x_6hour)    # (B, 128, N, 7*4 segment)
-
-        # return the feature
-        x_quarter = self.decode2(x_quarter)    # (B, 1, N, T/3)
-        x_hour = self.decode3(x_hour)    # (B, 1, N, T/12)
-        x_6hour = self.decode4(x_6hour)    # (B, 1, N, T/72)
-        x_week = self.decode5(x_week)    # (B, 1, N, T/288)
-
-        # output, return list of (B,N,t',1)
-        out =[x_quarter.permute(0,2,3,1), x_hour.permute(0,2,3,1), x_6hour.permute(0,2,3,1), x_week.permute(0,2,3,1)]
-
-        return out
 
 class single_scale(nn.Module):
 
@@ -116,39 +34,64 @@ class single_scale(nn.Module):
 
 class full_attns(nn.Module):
 
-    def __init__(self, in_dim1, in_dim2, hidden, DEVICE):
+    def __init__(self, in_dim1, in_dim2, adj, hidden=4, num_head=4):
         super(full_attns, self).__init__()
 
-        self.Q_mapping1 = nn.Linear(in_dim2, 1, bias=False)
-        self.Q_mapping2 = nn.Linear(in_dim1, hidden, bias=False)
-        self.K_mapping1 = nn.Linear(in_dim2, 1, bias=False)
-        self.K_mapping2 = nn.Linear(in_dim1, hidden, bias=False)
-        self.W = nn.Parameter(torch.rand(hidden, hidden)).float().to(DEVICE)
+        assert hidden % num_head == 0, 'hidden should be the multiplier of num_head'
+        self.W_mapping1 = nn.Linear(in_dim2, 1, bias=False)
+        self.W_mapping2 = nn.Linear(in_dim1, hidden, bias=False)
+        self.A_mapping = nn.Linear(2*int(hidden/num_head)+1, 1, bias=False)
+
+        self.num_heads = num_head
+        self.adj = adj.unsqueeze(-1).unsqueeze(-1).repeat(1,1,self.num_heads,1)    # (N,N,H,1)
+        self.activate = nn.GELU()
+
 
     def forward(self, x):
 
         '''
-        x: (B, attn_dim, in_dim1, in_dim2)
+        x: (B, N, F, T)
         '''
-        B, attn_dim, feature_dim1, feature_dim2 = x.shape
+        B, nodes, features, timesteps = x.shape
 
-        Q = self.Q_mapping2(torch.relu(self.Q_mapping1(x).squeeze(-1)))
-        K = self.K_mapping2(torch.relu(self.K_mapping1(x).squeeze(-1)))
-        A = torch.matmul(Q, self.W)    
-        A = torch.einsum('bij,bjk->bik', A, K.permute(0,2,1))    # return (B, attn_dim, attn_dim)
-        A = F.softmax(A, -1)
+        Q = self.W_mapping2(self.activate(self.W_mapping1(x).squeeze(-1)))   # (B,N,hidden)
+        Q = Q.unsqueeze(2).repeat(1,1,nodes,1)    # (B,N,N,hidden)
+        K = Q.permute(0,2,1,3)    # (B,N,N,hidden)
 
-        return A
+        # split the heads
+        Q = Q.view(B, nodes, nodes, self.num_heads, -1)    # (B,N,N,H,F/H)
+        K = K.view(B, nodes, nodes, self.num_heads, -1)    # (B,N,N,H,F/H)
+        adj = self.adj.unsqueeze(0).repeat(B,1,1,1,1)    # (B,N,N,H,1)
+
+        # combine and calculate scores
+        combine = torch.cat((Q, K, adj), -1)    # (B,N,N,H,2*F/H+1)
+        scores = self.activate(self.A_mapping(combine).squeeze(-1))    # (B,N,N,H)
+        scores = scores.permute(0,3,1,2)    # (B,H,N,N)
+
+        # for stability
+        # scores = F.softmax(scores, -1)    # (B,H,N,N)
+
+        return scores
 
 class GCN(nn.Module):
 
-    def __init__(self, adj, time_step, feature_dim, DEVICE):
+    def __init__(self, adj, out_len, configs):
         super(GCN, self).__init__()
 
-        self.attn_cal = full_attns(in_dim1=feature_dim, in_dim2=time_step, hidden=128, DEVICE=DEVICE)
-        self.W = nn.Parameter(torch.rand(feature_dim, 128).float().to(DEVICE))
-        self.adj = adj
-        self.Wout = nn.Parameter(torch.rand(128, feature_dim).float().to(DEVICE))
+        feature_dim = configs.d_model
+        num_head = configs.n_heads
+
+        assert feature_dim % num_head == 0, 'feature dimension should be multiplier of number of heads'
+        self.attn_cal = full_attns(in_dim1=feature_dim, in_dim2=out_len, adj=adj, hidden=32, num_head=num_head)
+        self.W = nn.Linear(feature_dim, int(feature_dim/num_head), bias=False)
+        
+        self.num_head = num_head
+        self.adj = adj.unsqueeze(0).repeat(self.num_head,1,1)    # (H,N,N)
+        self.zero_vec = -9e15 * torch.ones_like(self.adj)   # (H,N,N)
+
+        self.out_mapping = nn.Linear(int(feature_dim/num_head), feature_dim)
+
+        self.activate = nn.GELU()
     
     def forward(self, x):
 
@@ -159,14 +102,26 @@ class GCN(nn.Module):
         return: (B,N,T,F)
         '''
 
-        # adj2 is the real spatial attention score !
-        attn = self.attn_cal.forward(x.permute(0,1,3,2))    # (B,N,N)
-        adj2 = attn * self.adj.unsqueeze(0)     # (B,N,N)
+        B, nodes, timesteps, feature = x.shape
 
+        # update x values
+        x = self.W(x)    # return (B,N,T,F/H)
 
-        x_new = torch.matmul(x, self.W)    # return (B,N,T,64)
-        x_new = nn.GELU()(torch.einsum('bij,bjkl->bikl', adj2, x_new))    # return (B,N,T,64)
-        x_new = torch.matmul(x_new, self.Wout)    # return (B,N,T,1)
+        # calculate basic components
+        attns = self.attn_cal.forward(x.permute(0,1,3,2))    # (B,H,N,N)
+        adj = self.adj.unsqueeze(0).repeat(B,1,1,1)    # (B,H,N,N)
+        mask = self.zero_vec.unsqueeze(0).repeat(B,1,1,1)    # (B,H,N,N)
+
+        # calculate spatial attn score
+        adj2 = torch.where(adj > 0, attns, mask)    # (B,H,N,N)
+        adj2 = F.softmax(adj2, -1)
+
+        # feature aggregation
+        x_new = x # self.W(x)    # return (B,N,T,F/H)
+        x_new = self.activate(torch.einsum('bhij,bjkl->bhikl', adj2, x_new))    # return (B,H,N,T,F/H)
+        x_new = x_new.permute(0,2,3,4,1)    # return (B,N,T,F/H,H)
+        x_new = torch.mean(x_new, -1)    # return (B,N,T,F/H)
+        # x_new = self.out_mapping(x_new)    # return (B,N,T,F)
      
         return x_new, adj2
 
@@ -174,11 +129,22 @@ class AutoCorrelation(nn.Module):
     """
     
     """
-    def __init__(self, device, adj, out_len, feature_dim, patch, input_len, topk, n_head):
+    def __init__(self, device, out_len, patch, query_len, configs):
         super(AutoCorrelation, self).__init__()
+
+        # define query length
+        self.query_length = query_len
 
         # define the output len
         self.out_len = out_len
+
+        # define predict length
+        self.pred_len = configs.pred_len
+
+        # define time steps
+        self.time_steps = configs.time_steps
+
+        # assert self.pred_len % self.out_len == 0, 'prediction length must be the multiplier of output length'
 
         # define the device
         self.device = device
@@ -187,109 +153,62 @@ class AutoCorrelation(nn.Module):
         self.patch = patch
     
         # define top_k
-        self.topk = topk
+        self.topk = configs.topk
 
         # define number of head
-        self.num_head = n_head
+        self.num_head = configs.n_heads
+
+        # define feature dimension
+        feature_dim = configs.d_model
+
+        # define a zeros tensor
+        self.zeros = torch.zeros(configs.num_nodes, configs.time_steps, configs.d_model).to(self.device)
 
         # define module for "cal_QKV"
-        self.Q_mapping = single_scale(d_model=feature_dim, out_dim=self.num_head, patchsize=patch)
-        self.K_mapping = single_scale(d_model=feature_dim, out_dim=self.num_head, patchsize=patch)
-        self.V_mapping = single_scale(d_model=feature_dim, out_dim=int(feature_dim/self.num_head), patchsize=1)
-
-        # define spatial attention module for each chosen segemnt
-        self.GCN_agg = GCN(adj=adj, time_step=out_len, feature_dim=feature_dim, DEVICE=device)
-
-        # define a fully connected neural network
-        self.fcnn = nn.Sequential(nn.Linear(feature_dim, 512), nn.ReLU(), nn.Linear(512, feature_dim))
+        self.Q_mapping = single_scale(d_model=feature_dim+1, out_dim=self.num_head, patchsize=patch)
+        self.K_mapping = single_scale(d_model=feature_dim+1, out_dim=self.num_head, patchsize=patch)
+        self.V_mapping = single_scale(d_model=feature_dim+1, out_dim=int(feature_dim/self.num_head), patchsize=1)
+        self.out_mapping = nn.Linear(int(feature_dim/self.num_head), feature_dim)
 
         # define initial index
-        self.init_index = torch.arange(self.out_len).to(self.device)
+        self.init_index = torch.arange(self.out_len).to(self.device).unsqueeze(0).unsqueeze(0)    # (1,1,out_len)
+        self.init_index = self.init_index.repeat(configs.num_nodes, int(feature_dim/self.num_head), 1)    # (N,F,out_len)
 
-        # define the output mapping
-        self.out_mapping = nn.Linear(int(feature_dim/self.num_head), feature_dim, bias=False)
-
-    def time_delay_agg_train(self, values, corr, patchsize):
+    def time_delay_agg_full(self, values, corr):
         """
         Standard version of Autocorrelation
-        values: (B,N,T,1)
-        corr: (B,T/patchsize,F)
-        patchsize: scalar
-
-        return: (B,N,F,pred_len)
-        """
-        batch, nodes, T, feature  = values.shape    # feature == 1
-
-        # return (B,N,1,T)
-        values = values.permute(0,1,3,2)
-        corr = corr.permute(0,1,3,2)
-
-        # return (top_k)
-        '''
-        here is the case of batch size = 1, feature size = 1
-        we assume node share the same temporal attention
-        '''
-        corr = torch.mean(torch.mean(torch.mean(corr, 0), 0), 0)
-        weights, delay = torch.topk(corr, self.topk, dim=-1)
-
-        # update corr, return (top_k)
-        tmp_corr = torch.softmax(weights, dim=-1)
-
-        # aggregation
-        tmp_values = values    # return (B,N,1,T)
-        delays_agg = torch.zeros_like(values)    # return (B,N,1,T)
-
-        # time delay agg
-        for i in range(self.topk):
-            pattern = torch.roll(tmp_values, patchsize * int(delay[i]), dims=-1)    # return (B,N,1,T)
-            delays_agg = delays_agg + pattern * (tmp_corr[i])   # return (B,N,1,T)
-
-        # apply spatial self-attention
-        new_values = self.GCN_agg(values.permute(0,1,3,2))    # return (B,N,T,1)
-
-        return new_values, delay, tmp_corr
-
-    def time_delay_agg_full2(self, values, corr):
-        """
-        Standard version of Autocorrelation
-        values: (B,N,T,F)
-        corr: (B,N,T/patchsize,H)
+        values: (B,N,T,d_model/H) 
+        corr: (B,N,T,H)
         patchsize: scalar
 
         return: (B,N,1,T)
         """
-        batch, nodes, T, feature  = values.shape  
-
-        # defien feature per head
-        feature_per_head = int(feature/self.num_head)
+        batch, nodes, T, feature_per_head  = values.shape  
 
         # spilt the values
-        values = values.view(batch, nodes, T, feature_per_head, self.num_head)    # (B,N,T,F/H,H)
+        values = values.unsqueeze(-1).repeat(1, 1, 1, 1, self.num_head)    # (B,N,T,F/H,H)
          
         # return (B,N,F/H,H,T)
         values = values.permute(0,1,3,4,2)
-        # return (B,N,H,T/p)
+        # return (B,N,H,T)
         corr = corr.permute(0,1,3,2)
 
         # calculate average corr along the feture dimension
         # return (B,N,H,top_k)
+        # chunke the previous part
         weights, delay = torch.topk(corr, self.topk, dim=-1)
-        delay = self.patch * delay
-
-        # calculate attention score
-        # return (B,N,H,top_k)
         tmp_corr = torch.softmax(weights, dim=-1)
+        delay = self.patch * delay + self.query_length
 
         # aggregation
         tmp_values = torch.cat((values, values), -1)    # return (B,N,F/H,H,T+T)
+        indexs = self.init_index.unsqueeze(0).repeat(batch, 1, 1, 1)    # (B,N,F/H,out_len)
         
         output = []
         for j in range(self.num_head):
             
             # for each node, define zeros
-            delays_agg = torch.zeros_like(self.init_index)    
-            delays_agg = delays_agg.unsqueeze(0).unsqueeze(0).unsqueeze(0)    # return (1,1,1,out_len)
-            delays_agg = delays_agg.repeat(batch, nodes, feature_per_head,1)    # return (B,N,F/H,out_len)
+            delays_agg = torch.zeros_like(indexs)    # return (B,N,F/H,out_len)
 
             # delay per head
             delay_per_head = delay[:,:,j,:]    # (B,N,top_k)
@@ -303,7 +222,7 @@ class AutoCorrelation(nn.Module):
             # time delay agg
             for i in range(self.topk):
 
-                delay_index = self.init_index.unsqueeze(0).unsqueeze(0).unsqueeze(0) + delay_per_head[...,i].unsqueeze(-1).unsqueeze(-1).repeat(1, 1, feature_per_head, self.out_len)    # (B,N,F/H,out_len)
+                delay_index = indexs + delay_per_head[...,i].unsqueeze(-1).unsqueeze(-1)   # (B,N,F/H,out_len)
                 pattern = torch.gather(tmp_per_head, dim=-1, index=delay_index)   # return (B,N,F/H,out_len)
 
                 # obtain temporal score
@@ -313,93 +232,50 @@ class AutoCorrelation(nn.Module):
             # store the output
             output.append(delays_agg.unsqueeze(-1))
             
-        output = torch.cat(tuple(output), -1)    # return (B,N,F/H,out_len, H)
-        output = torch.mean(output, -1)    # return (B,N,F/H,out_len)
-        output = self.out_mapping(output.permute(0,1,3,2)).permute(0,1,3,2)    # return (B,N,F,out_len)
+        output = torch.cat(tuple(output), -1)    # return (B,N,F,out_len,H)
+        output = torch.mean(output, -1)    # return (B,N,F,out_len)
+        # output = self.out_mapping(output.permute(0,1,3,2)).permute(0,1,3,2)
 
         return output, delay, tmp_corr
 
-
-    def time_delay_agg_full(self, values, corr):
-        """
-        Standard version of Autocorrelation
-        values: (B,N,T,F)
-        corr: (B,T/patchsize,F)
-        patchsize: scalar
-
-        return: (B,N,1,T)
-        """
-        batch, nodes, T, feature  = values.shape    
-
-        # return (B,N,F,T)
-        values = values.permute(0,1,3,2)
-        # return (B,F,T/p)
-        corr = corr.permute(0,2,1)
-
-        # index init, return (B,N,F,out_len)
-        init_index = torch.arange(self.out_len).unsqueeze(0).unsqueeze(0).unsqueeze(0).repeat(batch, nodes, feature, 1).to(self.device)
-
-        # calculate average corr along the feture dimension
-        # return (B,F,top_k)
-        weights, delay = torch.topk(corr, self.topk, dim=-1)
-
-        # update corr, return (B,F,top_k)
-        tmp_corr = torch.softmax(weights, dim=-1)
-
-        # aggregation
-        tmp_values = torch.cat((values, values), -1)    # return (B,N,F,T+T)
-        delays_agg = torch.zeros_like(init_index)    # return (B,N,F,out_len)
-
-        # time delay agg
-        for i in range(self.topk):
-            delay_each = (delay[..., i]).unsqueeze(1).unsqueeze(-1).repeat(1,nodes,1,1)    # (B,N,F,1)
-            tmp_delay = init_index + self.patch * delay_each   # return (B,N,F,out_len)
-            pattern = torch.gather(tmp_values, dim=-1, index=tmp_delay)    # return (B,N,F,out_len)
-            tmp_corr_each = (tmp_corr[..., i]).unsqueeze(1).unsqueeze(-1).repeat(1,nodes,1,1)    # (B,N,F,1)
-            delays_agg = delays_agg + pattern * tmp_corr_each   # return (B,N,F,out_len)
-
-        # apply spatial self-attention
-        new_values = self.GCN_agg(delays_agg.permute(0,1,3,2))    # return (B,N,out_len,F)
-
-        return new_values, delay, tmp_corr
-
-    def cal_QKV(self, Q_in, K_in, V_in):
+    def cal_QKV(self, Q_in, K_in, V_in, t_stamp):
         '''
         this function is used to 
         1. calculate queries, keys and values
         2. calculate temporal correlation attention using keys and queries
 
         all input: (B,N,T,F)
+        t_stamp: (B,T_long)
         '''
+        B, N, T, f = V_in.shape
+        time_stamp_pos = t_stamp.unsqueeze(1).unsqueeze(-1)    # (B,1,T_long,1)
+        time_stamp_pos = time_stamp_pos.repeat(1,N,1,1)    # (B,N,T_long,1)
+        time_stamp_pos = time_stamp_pos[:,:,:T,:]    # (B,N,T,1)
+        Q_in = torch.cat((Q_in, time_stamp_pos), -1)
+        K_in = torch.cat((K_in, time_stamp_pos), -1)
+        # V_in = torch.cat((V_in, time_stamp_pos), -1)
 
-        queries = self.Q_mapping(Q_in)    # (B,N,t',H)
-        keys = self.K_mapping(K_in)    # (B,N,t',H)
-        values = self.V_mapping(V_in)    # (B,N,T,d_model/H)
+        # 
+        queries = self.V_mapping(Q_in)    # (B,N,T,H)
+        keys = self.V_mapping(K_in)    # (B,N,T,H)
+        values = V_in # self.V_mapping(V_in)    # (B,N,T,d_model/H)
 
-        # repeat the values, so same value is used in each head
-        values = values.repeat(1,1,1,self.num_head)    # (B,N,T,d_model)
+        q = queries    # (B,N,T,H)
+        k = keys    # (B,N,T,H)
+        q = q.permute(0,1,3,2)    # (B,N,H,T)
+        k = k.permute(0,1,3,2)    # (B,N,H,T)
 
-        q = queries    # (B,N,t',H)
-        k = keys    # (B,N,t',H)
-        q = q.permute(0,1,3,2)    # (B,N,H,t')
-        k = k.permute(0,1,3,2)    # (B,N,H,t')
-
-        # '''
-        # to speed up the computation, we calculate mean feature along all the nodes
-        # '''
-        # q = torch.mean(q, 1)    # (B,d_model,t')
-        # k = torch.mean(k, 1)    # (B,d_model,t')
 
         # apply fft
-        q_fft = torch.fft.rfft(q.contiguous(), dim=-1)    # (B,N,H,t')
-        k_fft = torch.fft.rfft(k.contiguous(), dim=-1)    # (B,N,H,t')
-        res = q_fft * torch.conj(k_fft)    # (B,N,H,t')
-        corr = torch.fft.irfft(res, dim=-1)    # (B,N,H,t')
-        corr = corr.permute(0,1,3,2)    # (B,N,t',H)
+        q_fft = torch.fft.rfft(q.contiguous(), dim=-1)    # (B,N,H,T)
+        k_fft = torch.fft.rfft(k.contiguous(), dim=-1)    # (B,N,H,T)
+        res = q_fft * torch.conj(k_fft)    # (B,N,H,T)
+        corr = torch.fft.irfft(res, dim=-1)    # (B,N,H,T)
+        corr = corr.permute(0,1,3,2)    # (B,N,T,H)
         
         return values, corr
 
-    def forward(self, Q_in, K_in, V_in):
+    def forward(self, Q_in, K_in, V_in, t):
 
         '''
         input
@@ -412,140 +288,205 @@ class AutoCorrelation(nn.Module):
         # obtain the shape
         B, N, T, F = V_in.shape
 
-        # # apply temporal position embedding
-        # Q_in = self.temporal_embed.forward(Q_in)
-        # K_in = self.temporal_embed.forward(K_in)
-        # V_in = self.temporal_embed.forward(V_in)
-
-        # apply QKV mapping, return (B,N,T,F), (B,N,t',H)
-        V_new, corr = self.cal_QKV(Q_in=Q_in, K_in=K_in, V_in=V_in)
+        # apply QKV mapping, return (B,N,T,d_model/H) (B,N,T,H)
+        V_new, corr = self.cal_QKV(Q_in=Q_in, K_in=K_in, V_in=V_in, t_stamp=t)
 
         # apply spatial-temporal delay aggregation, (B,N,F,out_len), (B,N,H,top_k), (B,N,H,top_k)
-        output, delay, delay_score = self.time_delay_agg_full2(V_new, corr)  
+        output, delay, delay_score = self.time_delay_agg_full(V_new, corr)  
 
-        # # apply spatial position embedding, return (B,N,out_len,F)
-        # output = self.spatial_embed.forward(output.permute(0,1,3,2))
-        output = output.permute(0,1,3,2)
+        output = output.permute(0,1,3,2)    # (B,N,out_len,F)
 
-        # apply spatial self-attention
-        new_values, sp_attn = self.GCN_agg(output)    # return (B,N,out_len,F), (B,N,N)
+        # # apply spatial self-attention
+        # output = self.layernorm(output)
+        # output = self.fcnn(output)    # return (B,N,out_len,F)
 
-        return new_values.contiguous(), (delay, delay_score, sp_attn)
+        return output.contiguous(), delay, delay_score
 
-class temporal_attn_agg(nn.Module):
-    def __init__(self, feature_dim):
-        super(temporal_attn_agg, self).__init__()
+class patch_atten(nn.Module):
 
-        self.fcnn1 = nn.Sequential(nn.Linear(feature_dim, 128), nn.ReLU())
-        self.fcnn2 = nn.Sequential(nn.ReLU(), nn.Linear(128, feature_dim))
+    def __init__(self, DEVICE, adj, configs):
+        super(patch_atten, self).__init__()
 
-    def forward(self, x, attns):
-
-        '''
-        input 
-        x: (B,N,T,F)
-        attns (B,T,T)
-
-        return (B,N,T,F)
-        '''
-        x = x.permute(0,2,1,3)    # return (B,T,N,F_in)
-        x = self.fcnn1(x)    # return (B,N,T,128)
-        x = torch.einsum('bij,bjkl->bikl', attns, x)    # return (B,T,N,128)
-        x = x.permute(0,2,1,3)   # return (B,N,T,128)
-        x = self.fcnn2(x)    # return (B,N,T,F_in)
-
-        return x
-
-class st_agg(nn.Module):
-
-    def __init__(self, pred_len, feature_dim, node_number, adj, DEVICE):
-        super(st_agg, self).__init__()
-
-        # temporal agg
-        self.temp_attn = full_attns(in_dim1=feature_dim, in_dim2=node_number, hidden=128, DEVICE=DEVICE)
-        self.temp_agg = temporal_attn_agg(feature_dim=feature_dim)
+        self.patch1 = 3
+        self.patch2 = 4
+        self.patch3 = 3
+        self.patch4 = 4
+        feature_dim = configs.d_model
+        self.pred_len = configs.pred_len
         
-        # spatial agg
-        self.GCN_agg = GCN(adj=adj, time_step=pred_len, feature_dim=feature_dim, DEVICE=DEVICE)
+        self.CAM1_mapping = nn.Sequential(nn.Linear(feature_dim * self.patch1, 32), nn.GELU(), nn.Linear(32,self.patch1))
+        self.CAM2_mapping = nn.Sequential(nn.Linear(feature_dim * self.patch2, 32), nn.GELU(), nn.Linear(32,self.patch2))
+        self.CAM3_mapping = nn.Sequential(nn.Linear(feature_dim * self.patch3, 32), nn.GELU(), nn.Linear(32,self.patch3))
+        self.CAM4_mapping = nn.Sequential(nn.Linear(feature_dim * self.patch4, 32), nn.GELU(), nn.Linear(32,self.patch4))
 
+        # Autocorrelation
+        self.cell1 = AutoCorrelation(device=DEVICE, out_len=self.pred_len,  patch=1, query_len=int(configs.time_steps/2), configs=configs)
+        self.cell2 = AutoCorrelation(device=DEVICE, out_len=int(self.pred_len/3),  patch=1, query_len=int(configs.time_steps/6), configs=configs)
+        self.cell3 = AutoCorrelation(device=DEVICE, out_len=int(self.pred_len/12), patch=1, query_len=int(configs.time_steps/24), configs=configs)
+        self.cell4 = AutoCorrelation(device=DEVICE, out_len=int(self.pred_len/36), patch=1, query_len=int(configs.time_steps/72), configs=configs)
+        self.cell5 = AutoCorrelation(device=DEVICE, out_len=int(self.pred_len/144), patch=1, query_len=int(configs.time_steps/288), configs=configs)
 
-    def forward(self, x):
+        
+    def patch_agg(self, x, mapping_function, patch_size):
 
         '''
-        input
-        x: (B,N,pred_len,F)
-
-        return 
-        (B,N,pred_len,F)
+        x: (B,N,T,F)
         '''
-        # temporal agg
-        x = x.permute(0,2,3,1)    # (B,pred_len,F,N)
-        temp_attn = self.temp_attn.forward(x)    # (B, pred_len, pred_len)
-        x = x.permute(0,3,1,2)    # (B,N,pred_len,F)
-        x = self.temp_agg.forward(x=x, attns=temp_attn)    # (B,N,pred_len,F)
+        # obtain the shape
+        B,N,T,feature = x.shape
 
-        # spatial agg
-        x = self.GCN_agg.forward(x)    # (B,N,pred_len,F)
+        # reshape return (B,N,T/p,p,F)
+        x = x.view(B,N,int(T/patch_size),patch_size,feature)
+
+        # apply CAM
+        x_out = x.reshape(B,N,int(T/patch_size), -1)
+        score = mapping_function(x_out)    # (B,N,T/p,p)
+        score = F.softmax(score, -1)    # (B,N,T/p,p)
+
+        # patch agg
+        score = score.unsqueeze(-1)    # (B,N,T/p,p,1)
+        x = score * x    # (B,N,T/p,p,F)
+        x = torch.sum(x, -2)    # (B,N,T/p,F)
 
         return x
+
+    def patch_forward(self, x):
+        '''
+        input x: (B,N,T,F)
+        '''
+
+        B,N,T,feature = x.shape
+
+        # apply patch attention for the first time
+        x0 = x
+        x1 = self.patch_agg(x0, self.CAM1_mapping, self.patch1)
+        x2 = self.patch_agg(x1, self.CAM2_mapping, self.patch2)
+        x3 = self.patch_agg(x2, self.CAM3_mapping, self.patch3)
+        x4 = self.patch_agg(x3, self.CAM4_mapping, self.patch4)
+
+        return [x0, x1, x2, x3, x4]
+
+    def forward(self, x, t):
+
+        [sp0_x0, sp0_x1, sp0_x2, sp0_x3, sp0_x4] = self.patch_forward(x)
+
+        sp0_query = sp0_x0[:,:,-int(0.5*sp0_x0.shape[2]):,:]
+        sp0_query = torch.cat((sp0_query, torch.zeros_like(sp0_query).to(sp0_query.device)), 2)
+        sp0_x0, delay1, delay_score1 = self.cell1.forward(Q_in=sp0_query, K_in=sp0_x0, V_in=sp0_x0, t=t)
+        sp0_x0 = sp0_x0  # (B,N,pred_len,F)
+        
+        sp1_query = sp0_x1[:,:,-int(0.5*sp0_x1.shape[2]):,:]
+        sp1_query = torch.cat((sp1_query, torch.zeros_like(sp1_query).to(sp1_query.device)), 2)
+        sp0_x1_out, delay2, delay_score2  = self.cell2.forward(Q_in=sp1_query, K_in=sp0_x1, V_in=sp0_x1, t=t)
+        sp0_x1 = torch.repeat_interleave(sp0_x1_out, 3, dim=2)
+        
+        sp2_query = sp0_x2[:,:,-int(0.5*sp0_x2.shape[2]):,:]
+        sp2_query = torch.cat((sp2_query, torch.zeros_like(sp2_query).to(sp2_query.device)), 2)
+        sp0_x2_out, delay3, delay_score3  = self.cell3.forward(Q_in=sp2_query, K_in=sp0_x2, V_in=sp0_x2, t=t)
+        sp0_x2 = torch.repeat_interleave(sp0_x2_out, 12, dim=2)
+        
+        sp3_query = sp0_x3[:,:,-int(0.5*sp0_x3.shape[2]):,:]
+        sp3_query = torch.cat((sp3_query, torch.zeros_like(sp3_query).to(sp3_query.device)), 2)
+        sp0_x3_out, delay4, delay_score4 = self.cell4.forward(Q_in=sp3_query, K_in=sp0_x3, V_in=sp0_x3, t=t)
+        sp0_x3 = torch.repeat_interleave(sp0_x3_out, 36, dim=2)
+
+        sp4_query = sp0_x4[:,:,-int(0.5*sp0_x4.shape[2]):,:]
+        sp4_query = torch.cat((sp4_query, torch.zeros_like(sp4_query).to(sp4_query.device)), 2)
+        sp0_x4_out, delay5, delay_score5 = self.cell5.forward(Q_in=sp4_query, K_in=sp0_x4, V_in=sp0_x4, t=t)
+        sp0_x4 = torch.repeat_interleave(sp0_x4_out, 144, dim=2)
+
+        return [sp0_x0, sp0_x1, sp0_x2, sp0_x3, sp0_x4], [delay1, delay2, delay3, delay4, delay5], [delay_score1, delay_score2, delay_score3, delay_score4, delay_score5]
+        
+
+
+
 
 class Autoformer(nn.Module):
+    
     def __init__(self, DEVICE, adj, configs):
         super(Autoformer, self).__init__()
 
         # used in the forward function
         self.pred_len = configs.pred_len
         self.d_model = configs.d_model
+        self.input_lenght = configs.time_steps
 
         # used in define the layers
-        out_len_list = configs.out_len
+        self.out_len_list = configs.out_len
         patch_list = configs.patch_list
 
+        # define a zeros tensor
+        self.zeros = torch.zeros(configs.num_nodes, self.pred_len, configs.d_model).to(DEVICE)
 
-        # encoder
-        self.cell1 = AutoCorrelation(device=DEVICE, adj=adj, out_len=out_len_list[0], feature_dim=configs.d_model, patch=patch_list[0], input_len=configs.time_steps, topk=configs.topk, n_head=configs.n_heads)
-        self.cell2 = AutoCorrelation(device=DEVICE, adj=adj, out_len=out_len_list[1], feature_dim=configs.d_model, patch=patch_list[1], input_len=out_len_list[0], topk=configs.topk, n_head=configs.n_heads)
+        # spatial encoder  
+        self.GCN_agg1 = GCN(adj=adj, out_len=configs.time_steps, configs=configs)
+        self.GCN_agg2 = GCN(adj=adj, out_len=configs.time_steps, configs=configs)
+        self.GCN_agg3 = GCN(adj=adj, out_len=configs.time_steps, configs=configs)
 
-        # decoder
-        self.cell3 = AutoCorrelation(device=DEVICE, adj=adj, out_len=out_len_list[2], feature_dim=configs.d_model, patch=patch_list[2], input_len=out_len_list[1], topk=configs.topk, n_head=configs.n_heads)
-        self.cell4 = AutoCorrelation(device=DEVICE, adj=adj, out_len=out_len_list[3], feature_dim=configs.d_model, patch=patch_list[3], input_len=out_len_list[2], topk=configs.topk, n_head=configs.n_heads)
-        self.cell5 = AutoCorrelation(device=DEVICE, adj=adj, out_len=self.pred_len, feature_dim=configs.d_model, patch=patch_list[4], input_len=out_len_list[3], topk=configs.topk, n_head=configs.n_heads)
+        # patch attention
+        self.patch_att1 = patch_atten(DEVICE=DEVICE, adj=adj, configs=configs)
+        self.patch_att2 = patch_atten(DEVICE=DEVICE, adj=adj, configs=configs)
+        self.patch_att3 = patch_atten(DEVICE=DEVICE, adj=adj, configs=configs)
+        self.patch_att4 = patch_atten(DEVICE=DEVICE, adj=adj, configs=configs)
 
+        self.relu_fcnn = nn.Sequential(nn.Linear(configs.d_model * 21, 512), nn.Tanh(), nn.Linear(512,512), nn.Tanh(), nn.Linear(512,21))
 
-    def forward(self, x_enc):
+    def forward(self, x_enc, t):
 
         '''
         x_enc: (B,N,T,F)
         '''
-
         B,N,T,F = x_enc.shape
 
-        # always use perd_len segment as decoder input
-        x_dec = x_enc[:, :, -self.pred_len:, :]
-        x_dec = torch.cat((x_dec, torch.zeros(B, N, T-self.pred_len, self.d_model).to(x_dec.device)), 2)
+        # define initialization
+        x_init = (x_enc[:,:,-1,:].unsqueeze(-2)).repeat(1,1,self.pred_len,1)
+        # x_enc = x_enc - x_init.repeat(1,1,7*24,1)
 
-        # encode information
-        x_enc, explain1= self.cell1.forward(x_enc, x_enc, x_enc)    # (B,N,out_len_list[0],F)
-        x_enc, explain2 = self.cell2.forward(x_enc, x_enc, x_enc)    # (B,N,out_len_list[1],F)
+        # apply spatial encoding
+        x_enc0 = x_enc
+        x_enc1, sp_attn1 = self.GCN_agg1.forward(x_enc0) 
+        x_enc2, sp_attn2 = self.GCN_agg2.forward(x_enc1) 
+        x_enc3, sp_attn3 = self.GCN_agg3.forward(x_enc2) 
 
-        # transform attention
-        x_dec = x_dec[:,:,:x_enc.shape[2],:]
-        x_dec_out, explain3 = self.cell3.forward(x_dec, x_enc, x_enc)    # (B,N,out_len_list[1],F)
-        x_dec = x_dec_out + x_dec[:,:,:x_dec_out.shape[2],:]    # (B,N,out_len_list[1],F)
+        # apply patch attention, return (B,N,T,F)
+        [sp0_x0, sp0_x1, sp0_x2, sp0_x3, sp0_x4], \
+        [delay00, delay01, delay02, delay03, delay04],\
+        [delay_score00, delay_score01, delay_score02, delay_score03, delay_score04] = self.patch_att1.forward(x=x_enc0, t=t)
+        
+        [sp1_x0, sp1_x1, sp1_x2, sp1_x3, sp1_x4], \
+        [delay10, delay11, delay12, delay13, delay14],\
+        [delay_score10, delay_score11, delay_score12, delay_score13, delay_score14] = self.patch_att2.forward(x=x_enc1, t=t)
+        
+        [sp2_x0, sp2_x1, sp2_x2, sp2_x3, sp2_x4], \
+        [delay20, delay21, delay22, delay23, delay24],\
+        [delay_score20, delay_score21, delay_score22, delay_score23, delay_score24] = self.patch_att3.forward(x=x_enc2, t=t)
+        
+        [sp3_x0, sp3_x1, sp3_x2, sp3_x3, sp3_x4], \
+        [delay30, delay31, delay32, delay33, delay34],\
+        [delay_score30, delay_score31, delay_score32, delay_score33, delay_score34] = self.patch_att4.forward(x=x_enc3, t=t)
 
-        # decode information
-        x_dec_out, explain4 = self.cell4.forward(x_dec, x_dec, x_dec)    # (B,N,out_len[],F)
-        x_dec = x_dec_out + x_dec[:,:,:x_dec_out.shape[2],:]    # (B,N,out_len[],F)
-        x_dec_out, explain5 = self.cell5.forward(x_dec, x_dec, x_dec)    # (B,N,pred_len,F)
-        x_dec = x_dec_out + x_dec[:,:,:self.pred_len,:]    # (B,N,pred_len,F)
 
+        # combine all the inputs, return (B,N,pred_len,F,16)
+        output = torch.cat((sp0_x0.unsqueeze(-1), sp0_x1.unsqueeze(-1), sp0_x2.unsqueeze(-1), sp0_x3.unsqueeze(-1), sp0_x4.unsqueeze(-1),\
+            sp1_x0.unsqueeze(-1), sp1_x1.unsqueeze(-1), sp1_x2.unsqueeze(-1), sp1_x3.unsqueeze(-1), sp1_x4.unsqueeze(-1),\
+            sp2_x0.unsqueeze(-1), sp2_x1.unsqueeze(-1), sp2_x2.unsqueeze(-1), sp2_x3.unsqueeze(-1), sp2_x4.unsqueeze(-1),\
+            sp3_x0.unsqueeze(-1), sp3_x1.unsqueeze(-1), sp3_x2.unsqueeze(-1), sp3_x3.unsqueeze(-1), sp3_x4.unsqueeze(-1), x_init.unsqueeze(-1)), -1)
 
-        explains = [explain1, explain2, explain3, explain4, explain5]
+        # return (B,N,pred_len,F)
+        activate_score = torch.exp(self.relu_fcnn(output.view(B,N,self.pred_len,-1)))
+        output = activate_score.unsqueeze(-2) * output
+        output = torch.mean(output, -1)
 
-        # # fully-attention decoder, (B,N,pred_len,F)
-        # x_dec = self.st_agg.forward(x_dec)
+        # record attention score
+        sp_attns = [sp_attn1, sp_attn2, sp_attn3]
+        te_attns_delays = [delay00, delay01, delay02, delay03, delay04, delay10, delay11, delay12, delay13, delay14,\
+                           delay20, delay21, delay22, delay23, delay24, delay30, delay31, delay32, delay33, delay34]
+        te_attns_score = [delay_score00, delay_score01, delay_score02, delay_score03, delay_score04,\
+                          delay_score10, delay_score11, delay_score12, delay_score13, delay_score14,\
+                          delay_score20, delay_score21, delay_score22, delay_score23, delay_score24,\
+                          delay_score30, delay_score31, delay_score32, delay_score33, delay_score34]
 
-        return x_dec, explains
+        return output, [activate_score, sp_attns, te_attns_delays, te_attns_score]
 
 
 class Model(nn.Module):
@@ -561,15 +502,17 @@ class Model(nn.Module):
         self.topk = configs.topk
         self.encoder_length = configs.time_steps
         self.n_head = configs.n_heads
+        self.time_steps = configs.time_steps
+        self.num_nodes = configs.num_nodes
 
         # define t_embedding neural network
-        self.t_embed = time_embedding(out_dim=configs.d_model)
+        self.encoder = nn.Sequential(nn.Linear(1, 256), nn.Tanh(), nn.Linear(256,256), nn.Tanh(), nn.Linear(256,256), nn.Tanh(), nn.Linear(256, configs.d_model))
 
         # define the Autoformer
         self.A1 = Autoformer(DEVICE=DEVICE, adj=adj, configs=configs)
 
         # out projection
-        self.out_proj = nn.Sequential(nn.Linear(configs.d_model * self.pred_len, 1024), nn.ReLU(), nn.Linear(1024, self.pred_len))
+        self.decoder = nn.Sequential(nn.Linear(configs.d_model, 512), nn.Tanh(), nn.Linear(512,256), nn.Tanh(), nn.Linear(256,256), nn.Tanh(), nn.Linear(256, 1))
         
     def forward(self, x_enc, t):
         '''
@@ -580,17 +523,20 @@ class Model(nn.Module):
         return: (B, T = num_pred_len * pred_len, N)
         '''
 
-        B,T,N = x_enc.shape
- 
-        x_enc = self.t_embed.forward(x_enc, t)
+        # always use segment of length of pred_len to initialize the future
+        # return (B,pred_len,F)
+        x_enc = x_enc.unsqueeze(-1)    # (B,T,N,1)
+
+        # apply encoder: (B,T,N,F)
+        x_enc = self.encoder(x_enc)
         # permute the shape, return (B,N,T,F)
         x_enc = x_enc.permute(0,2,1,3)
 
         # apply the Graph Autoformer
-        out, explains = self.A1(x_enc)
+        out, explains = self.A1(x_enc, t)
 
         # apply out projection
-        out = self.out_proj(out.view(B,N,-1))    # (B,N,pred_len)
+        out = self.decoder(out).squeeze(-1)    # (B,N,pred_len)
 
         # output, return (B,pred_len,N)
         out = out.permute(0,2,1)
