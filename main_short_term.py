@@ -5,8 +5,8 @@ import pandas as pd
 from torch import optim
 
 import argparse
-from models.model_short_term_less_explainable import Model as GNN_autoformer
-from utils.data_short_term2 import trainingset_construct, load_graph_data, sparse_adj
+from models.model_feature_fusion import Model as GNN_autoformer
+from utils.data_feature_fusion import trainingset_construct, load_graph_data, sparse_adj
 from utils.train_test import train, eval
 
 # define random seed
