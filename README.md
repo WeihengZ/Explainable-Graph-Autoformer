@@ -2,18 +2,23 @@
 
 This repository is the code of the paper: [Explainable Graph Pyramid Autoformer (X-GPA) for Long-Term Traffic Forecasting](https://arxiv.org/abs/2209.13123).
 
+## Getting start
+```
+pip install -r requirements.txt
+```
+
 ## data
 
 We use dataset of PEMS-bay and Metr-LA traffic dataset for validation. Please put the data (h5 file) in the folder "data".
 
 ## implement
 
-For short-term prediction:
+For reproducing the results of short-term prediction:
 ```
 python main_short_term.py
 ```
 
-For long-term prediction:
+For reproducing the results of long-term prediction:
 ```
 python main_long_term.py
 ```
